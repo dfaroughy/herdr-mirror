@@ -39,6 +39,7 @@ use tokio::time::Instant;
 
 use crate::util::{err, Result};
 use crate::grid::{Grid, Renderer};
+use crate::predict::Predictor;
 
 // ---------------------------------------------------------------------------
 // args
@@ -329,6 +330,55 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
 
+/// Scan remote output for DECSET/DECRST of mouse-tracking modes (1000/1002/1003)
+/// and update `on` accordingly. Handles combined params (`ESC [ ? 1002 ; 1006 h`).
+/// Encoding-only modes (1005/1006/1015) don't flip tracking on their own.
+fn scan_mouse_mode(bytes: &[u8], on: &mut bool) {
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' && bytes[i + 2] == b'?' {
+            let mut j = i + 3;
+            let mut nums: Vec<u32> = Vec::new();
+            let mut cur: u32 = 0;
+            let mut have = false;
+            loop {
+                if j >= bytes.len() {
+                    break;
+                }
+                match bytes[j] {
+                    b'0'..=b'9' => {
+                        cur = cur.saturating_mul(10).saturating_add((bytes[j] - b'0') as u32);
+                        have = true;
+                        j += 1;
+                    }
+                    b';' => {
+                        if have {
+                            nums.push(cur);
+                        }
+                        cur = 0;
+                        have = false;
+                        j += 1;
+                    }
+                    b'h' | b'l' => {
+                        if have {
+                            nums.push(cur);
+                        }
+                        if nums.iter().any(|&n| n == 1000 || n == 1002 || n == 1003) {
+                            *on = bytes[j] == b'h';
+                        }
+                        j += 1;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the wrapper state machine
 
@@ -358,6 +408,12 @@ struct App {
     pending_input: Vec<Vec<u8>>,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
+    /// whether the remote program has enabled mouse tracking (DECSET 1000/1002/1003).
+    /// clicks/drags are only forwarded to the remote when this is on, so a plain
+    /// shell (no mouse mode) never receives raw SGR mouse reports as keystrokes.
+    remote_mouse: bool,
+    /// predictive local echo — draws keystrokes optimistically, frame-verified
+    predict: Predictor,
 }
 
 impl App {
@@ -365,8 +421,22 @@ impl App {
         if !self.tty {
             return;
         }
+        if self.predict.take_dirty() {
+            // cleared predictions may have left ghost chars — full repaint
+            self.renderer.invalidate();
+        }
         let (cols, rows) = term_size();
-        let out = self.renderer.paint(&self.grid, cols, rows);
+        let mut out = self.renderer.paint(&self.grid, cols, rows);
+        // inject the prediction overlay inside the synchronized-update block
+        let overlay = self.predict.overlay(&self.grid, cols, rows);
+        if !overlay.is_empty() {
+            const SYNC_END: &str = "\x1b[?2026l";
+            if let Some(pos) = out.rfind(SYNC_END) {
+                out.insert_str(pos, &overlay);
+            } else {
+                out.push_str(&overlay);
+            }
+        }
         write_stdout(&out);
     }
 
@@ -402,6 +472,11 @@ impl App {
 
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
+        // fresh attach: assume no remote mouse tracking until the remote's
+        // output re-declares it (a full-screen app re-emits on redraw).
+        self.remote_mouse = false;
+        // and re-earn prediction confidence against the new session's frames
+        self.predict = Predictor::new();
         let (cols, rows) = match m {
             Mode::Observe => self.observe_size(),
             Mode::Control => term_size(),
@@ -485,7 +560,12 @@ impl App {
             self.grid.clear();
         }
         if let Ok(decoded) = B64.decode(bytes) {
+            // track whether the remote app wants mouse input, so control-mode
+            // clicks/drags are only forwarded when it does (see handle_stdin)
+            scan_mouse_mode(&decoded, &mut self.remote_mouse);
             self.grid.apply(&String::from_utf8_lossy(&decoded));
+            // reconcile predictive echo against the authoritative frame
+            self.predict.on_frame(&self.grid);
         }
         if self.args.dump {
             let lines: Vec<String> = self.grid.text_lines().into_iter().filter(|l| !l.is_empty()).collect();
@@ -592,9 +672,12 @@ impl App {
                         "row": y.saturating_sub(1),
                         "modifiers": 0,
                     }));
-                } else {
+                } else if self.remote_mouse {
+                    // remote app has mouse tracking on — forward the click/drag
                     rest.extend_from_slice(&buf[i..i + len]);
                 }
+                // else: remote has no mouse mode (e.g. a plain shell) — drop the
+                // event so raw SGR reports don't land on the prompt as keystrokes
                 i += len;
             } else {
                 rest.push(buf[i]);
@@ -607,6 +690,10 @@ impl App {
         if !rest.is_empty() {
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
             self.send(msg).await;
+            // optimistic local echo: draw the keystroke now, verify on frame
+            if self.predict.on_input(&rest, &self.grid) {
+                self.paint();
+            }
         }
     }
 }
@@ -664,6 +751,8 @@ pub async fn run(args: Args) -> Result<()> {
         pending_input: Vec::new(),
         last_input: Instant::now(),
         hint_clear_at: None,
+        remote_mouse: false,
+        predict: Predictor::new(),
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
@@ -685,6 +774,7 @@ pub async fn run(args: Args) -> Result<()> {
             app.reconnect_at.map(|(t, _)| t),
             app.hint_clear_at,
             idle_at,
+            app.predict.deadline(),
         ]);
 
         tokio::select! {
@@ -731,6 +821,10 @@ pub async fn run(args: Args) -> Result<()> {
                     app.switch_mode(Mode::Observe);
                     app.hint("control released (idle) — type to retake");
                 }
+                if app.predict.deadline().is_some_and(|t| t <= now) {
+                    app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
+                    app.paint();
+                }
             }
         }
     }
@@ -766,6 +860,25 @@ mod tests {
         assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
+    }
+
+    #[test]
+    fn remote_mouse_mode_tracking() {
+        let mut on = false;
+        // shell output: no mouse mode → stays off
+        scan_mouse_mode(b"user@host:~$ ls\r\n", &mut on);
+        assert!(!on);
+        // app enables button-event + SGR (combined params) → on
+        scan_mouse_mode(b"\x1b[?1002;1006h", &mut on);
+        assert!(on);
+        // app disables tracking (e.g. on exit) → off; 1006-only doesn't re-enable
+        scan_mouse_mode(b"\x1b[?1002l\x1b[?1006l", &mut on);
+        assert!(!on);
+        // any-event tracking (1003) also counts
+        scan_mouse_mode(b"\x1b[?1003h", &mut on);
+        assert!(on);
+        scan_mouse_mode(b"\x1b[?1000l", &mut on);
+        assert!(!on);
     }
 
     #[test]
