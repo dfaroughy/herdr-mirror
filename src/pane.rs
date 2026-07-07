@@ -442,9 +442,44 @@ struct App {
     remote_mouse: bool,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
+    /// wheel coalescing: trackpad flicks emit event bursts, but the queue only
+    /// drains at round-trip pace — so after an immediate first notch, deltas
+    /// accumulate (signed: +down/-up) and flush as ONE message per window
+    pending_scroll: i32,
+    scroll_pos: (u32, u32),
+    scroll_flush_at: Option<Instant>,
+}
+
+/// wheel-burst accumulation window; ~1/5 of the laptop↔NERSC round trip, so a
+/// flick keeps at most a handful of scroll messages in flight instead of dozens
+const SCROLL_COALESCE: Duration = Duration::from_millis(20);
+
+fn scroll_msg(lines: i32, pos: (u32, u32)) -> serde_json::Value {
+    json!({
+        "type": "terminal.scroll",
+        "direction": if lines < 0 { "up" } else { "down" },
+        "lines": lines.abs(),
+        "source": "wheel",
+        "column": pos.0,
+        "row": pos.1,
+        "modifiers": 0,
+    })
 }
 
 impl App {
+    /// coalescing-window deadline: send accumulated wheel deltas as one message
+    /// and roll the window; an empty window ends the burst
+    async fn flush_scroll(&mut self) {
+        let pending = std::mem::take(&mut self.pending_scroll);
+        if pending == 0 {
+            self.scroll_flush_at = None;
+            return;
+        }
+        self.scroll_flush_at = Some(Instant::now() + SCROLL_COALESCE);
+        let msg = scroll_msg(pending, self.scroll_pos);
+        self.send(msg).await;
+    }
+
     fn paint(&mut self) {
         if !self.tty {
             return;
@@ -498,19 +533,17 @@ impl App {
         }
     }
 
-    /// Mirror remote_mouse onto the local terminal's mouse-tracking grab.
-    /// Grabbed: clicks/drags/wheel reach us for forwarding (remote TUI wants
-    /// them). Released: the hosting terminal owns the mouse again, so native
-    /// drag-select/copy works while the remote is at a plain prompt.
+    /// Keep the local mouse-tracking grab permanently on: the wheel must reach
+    /// us even when the remote app has no mouse mode (Claude Code transcripts
+    /// scroll via terminal.scroll against the remote emulator's scrollback).
+    /// Native drag-select/copy is still available via shift+drag (Ghostty's
+    /// tracking bypass); plain clicks at mouse-less remotes are dropped in
+    /// handle_stdin. remote_mouse still gates click/drag FORWARDING.
     fn sync_mouse_grab(&mut self) {
         if !self.tty {
             return;
         }
-        write_stdout(if self.remote_mouse {
-            "\x1b[?1002h\x1b[?1006h"
-        } else {
-            "\x1b[?1002l\x1b[?1006l"
-        });
+        write_stdout("\x1b[?1002h\x1b[?1006h");
     }
 
     async fn connect(&mut self, m: Mode) {
@@ -519,6 +552,9 @@ impl App {
         // output re-declares it (a full-screen app re-emits on redraw).
         self.remote_mouse = false;
         self.sync_mouse_grab();
+        // scroll deltas aimed at the old session don't belong to the new one
+        self.pending_scroll = 0;
+        self.scroll_flush_at = None;
         // and re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
         let (cols, rows) = match m {
@@ -606,13 +642,8 @@ impl App {
         if let Ok(decoded) = B64.decode(bytes) {
             frame_dbg(&self.args.pane_target, &frame, &decoded);
             // track whether the remote app wants mouse input, so control-mode
-            // clicks/drags are only forwarded when it does (see handle_stdin),
-            // and mirror transitions onto the local grab (selection vs forward)
-            let had_mouse = self.remote_mouse;
+            // clicks/drags are only forwarded when it does (see handle_stdin)
             scan_mouse_mode(&decoded, &mut self.remote_mouse);
-            if self.remote_mouse != had_mouse {
-                self.sync_mouse_grab();
-            }
             self.grid.apply(&String::from_utf8_lossy(&decoded));
             // reconcile predictive echo against the authoritative frame
             self.predict.on_frame(&self.grid);
@@ -713,15 +744,14 @@ impl App {
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
                 if press && (btn == 64 || btn == 65) {
-                    scrolls.push(json!({
-                        "type": "terminal.scroll",
-                        "direction": if btn == 64 { "up" } else { "down" },
-                        "lines": 3,
-                        "source": "wheel",
-                        "column": x.saturating_sub(1),
-                        "row": y.saturating_sub(1),
-                        "modifiers": 0,
-                    }));
+                    self.scroll_pos = (x.saturating_sub(1), y.saturating_sub(1));
+                    if self.scroll_flush_at.is_none() {
+                        // first notch of a burst: send now, open a coalescing window
+                        scrolls.push(scroll_msg(if btn == 64 { -3 } else { 3 }, self.scroll_pos));
+                        self.scroll_flush_at = Some(Instant::now() + SCROLL_COALESCE);
+                    } else {
+                        self.pending_scroll += if btn == 64 { -3 } else { 3 };
+                    }
                 } else if self.remote_mouse {
                     // remote app has mouse tracking on — forward the click/drag
                     rest.extend_from_slice(&buf[i..i + len]);
@@ -754,13 +784,13 @@ impl App {
 pub async fn run(args: Args) -> Result<()> {
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let raw = if tty {
-        // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
-        // clicks reach us instead of scrolling the hosting pane's scrollback
-        // alt-screen only — the local mouse grab (1002/1006) is DYNAMIC: it
-        // mirrors remote_mouse (see sync_mouse_grab), so while the remote is a
-        // plain shell the hosting terminal keeps native drag-select/copy, and
-        // the grab engages only when a remote app actually wants the mouse.
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H");
+        // 1002/1006: button-event mouse tracking with SGR encoding, held for the
+        // wrapper's whole life so the wheel always reaches us — transcripts of
+        // mouse-less remote apps (Claude Code) scroll via terminal.scroll against
+        // the remote emulator's scrollback. Cost: native drag-select needs
+        // shift+drag (terminal tracking bypass). Clicks are still only FORWARDED
+        // when the remote app wants the mouse (see handle_stdin).
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h");
         RawMode::enable()
     } else {
         None
@@ -807,6 +837,9 @@ pub async fn run(args: Args) -> Result<()> {
         hint_clear_at: None,
         remote_mouse: false,
         predict: Predictor::new(),
+        pending_scroll: 0,
+        scroll_pos: (0, 0),
+        scroll_flush_at: None,
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
@@ -829,6 +862,7 @@ pub async fn run(args: Args) -> Result<()> {
             app.hint_clear_at,
             idle_at,
             app.predict.deadline(),
+            app.scroll_flush_at,
         ]);
 
         tokio::select! {
@@ -878,6 +912,9 @@ pub async fn run(args: Args) -> Result<()> {
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
                     app.paint();
+                }
+                if app.scroll_flush_at.is_some_and(|t| t <= now) {
+                    app.flush_scroll().await;
                 }
             }
         }
