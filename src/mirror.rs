@@ -305,7 +305,7 @@ fn mirror_pane_cwd(state_dir: &std::path::Path) -> std::path::PathBuf {
 
 /// Is this remote pane another herdr-mirror's streamer pane? Read from the
 /// snapshot cwd marker — free, and race-free.
-fn pane_is_mirror(p: &PaneInfo) -> bool {
+pub fn pane_is_mirror(p: &PaneInfo) -> bool {
     let is_marker = |c: &Option<String>| {
         c.as_deref()
             .and_then(|s| std::path::Path::new(s).file_name())

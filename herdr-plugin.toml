@@ -74,3 +74,10 @@ command = ["./target/release/herdr-mirror", "teardown"]
 [[events]]
 on = "workspace.focused"
 command = ["./target/release/herdr-mirror", "ensure"]
+
+# Machine-aware pane creation: a native split inside a mirror workspace (pane
+# menu / prefix+v / prefix+minus) makes a local pane; adopt replaces it with
+# the equivalent REMOTE split. Quiet no-op everywhere else.
+[[events]]
+on = "pane.split"
+command = ["./target/release/herdr-mirror", "adopt"]
