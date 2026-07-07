@@ -379,6 +379,34 @@ fn scan_mouse_mode(bytes: &[u8], on: &mut bool) {
     }
 }
 
+// debug tracing (temporary): presence of the marker file enables appending
+// each control-session frame's raw ANSI to frames-debug.log, for diagnosing
+// grid-decode gaps against live delta frames (observers only ever get the
+// initial full frame, so this tap is the only way to see deltas)
+fn frame_dbg(pane: &str, frame: &Frame, decoded: &[u8]) {
+    use std::io::Write as _;
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = std::path::Path::new(&home).join(".local/state/herdr-mirror");
+    if !dir.join("frame-debug-on").exists() {
+        return;
+    }
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).open(dir.join("frames-debug.log"))
+    {
+        let _ = writeln!(
+            f,
+            "[{}] {} seq={:?} full={:?} {}x{} :: {:?}",
+            std::process::id(),
+            pane,
+            frame.seq,
+            frame.full,
+            frame.width.unwrap_or(0),
+            frame.height.unwrap_or(0),
+            String::from_utf8_lossy(decoded)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the wrapper state machine
 
@@ -560,6 +588,7 @@ impl App {
             self.grid.clear();
         }
         if let Ok(decoded) = B64.decode(bytes) {
+            frame_dbg(&self.args.pane_target, &frame, &decoded);
             // track whether the remote app wants mouse input, so control-mode
             // clicks/drags are only forwarded when it does (see handle_stdin)
             scan_mouse_mode(&decoded, &mut self.remote_mouse);
