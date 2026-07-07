@@ -1,5 +1,5 @@
 // Auto-adopt: make every pane-creation path machine-aware. Fired by the
-// pane.split plugin event: a native split inside a mirror workspace (right-click
+// pane.created plugin event: a native split inside a mirror workspace (right-click
 // pane menu, prefix+v / prefix+minus — herdr core knows nothing about machines)
 // creates a LOCAL shell pane; this pass replaces it with the equivalent REMOTE
 // split, which the daemon then mirrors back.

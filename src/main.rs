@@ -75,7 +75,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
         }
-        // pane.split event hook: replace stray local splits in mirror workspaces
+        // pane.created event hook: replace stray local splits in mirror workspaces
         // with their remote equivalents (must be quiet on the no-stray path)
         "adopt" => rt.block_on(adopt::run(Env::resolve()?)),
         "remote-workspace" => rt.block_on(remote_action::run(Env::resolve()?, "workspace", None)),

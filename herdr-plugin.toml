@@ -79,5 +79,5 @@ command = ["./target/release/herdr-mirror", "ensure"]
 # menu / prefix+v / prefix+minus) makes a local pane; adopt replaces it with
 # the equivalent REMOTE split. Quiet no-op everywhere else.
 [[events]]
-on = "pane.split"
+on = "pane.created"
 command = ["./target/release/herdr-mirror", "adopt"]
