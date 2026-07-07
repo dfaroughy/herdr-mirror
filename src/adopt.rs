@@ -19,50 +19,14 @@ use serde_json::json;
 
 use crate::api::ApiClient;
 use crate::config::load_config;
-use crate::mirror::{fetch_snapshot, pane_is_mirror, PaneInfo, Snapshot};
+use crate::mirror::{
+    export_layout_root, fetch_snapshot, locate_in_layout, pane_is_mirror, PaneInfo,
+};
 use crate::remote::RemoteHost;
 use crate::state::load_state;
 use crate::util::{Env, Result};
 
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
-fn rect(snap: &Snapshot, tab_id: &str, pane_id: &str) -> Option<(u32, u32)> {
-    snap.layouts
-        .iter()
-        .find(|l| l.tab_id == tab_id)?
-        .panes
-        .iter()
-        .find(|p| p.pane_id == pane_id)
-        .map(|p| (p.rect.width, p.rect.height))
-}
-
-/// Which owned sibling was this stray split off from, and in which direction?
-/// A split preserves the perpendicular dimension: equal widths → the tiles are
-/// stacked (down), equal heights → side by side (right). Without layout data,
-/// fall back to the first sibling and "right" — a slightly wrong direction on
-/// the correct machine still beats a pane on the wrong machine.
-fn pick_source<'a>(
-    snap: &Snapshot,
-    stray: &PaneInfo,
-    sibs: &[&'a PaneInfo],
-) -> Option<(&'a PaneInfo, &'static str)> {
-    if let Some((sw, sh)) = rect(snap, &stray.tab_id, &stray.pane_id) {
-        let mut by_height: Option<&PaneInfo> = None;
-        for s in sibs {
-            let Some((w, h)) = rect(snap, &s.tab_id, &s.pane_id) else { continue };
-            if w == sw {
-                return Some((s, "down"));
-            }
-            if h == sh && by_height.is_none() {
-                by_height = Some(s);
-            }
-        }
-        if let Some(s) = by_height {
-            return Some((s, "right"));
-        }
-    }
-    sibs.first().map(|s| (*s, "right"))
-}
 
 pub async fn run(env: Env) -> Result<()> {
     tokio::time::sleep(SETTLE).await;
@@ -104,39 +68,63 @@ pub async fn run(env: Env) -> Result<()> {
             continue;
         }
 
+        // resolve every stray's (source, direction) from the local split tree
+        // BEFORE closing anything — the tree is exact (it records how the user
+        // actually split), and closing the stray reshapes it
+        let mut resolved: Vec<(&PaneInfo, String, String)> = Vec::new();
+        for stray in strays {
+            let placed = match export_layout_root(&local, &stray.tab_id).await {
+                Some(root) => locate_in_layout(&root, &stray.pane_id),
+                None => None,
+            };
+            let src_rid = placed.as_ref().and_then(|(_, sibs)| {
+                sibs.iter().find(|id| owned.contains(id)).and_then(|id| pane_rid.get(id))
+            });
+            match (placed.as_ref(), src_rid) {
+                (Some((dir, _)), Some(rid)) => {
+                    resolved.push((stray, dir.clone(), (*rid).clone()));
+                }
+                _ => println!(
+                    "adopt: stray {} does not resolve to a mirror sibling — leaving it local",
+                    stray.pane_id
+                ),
+            }
+        }
+        if resolved.is_empty() {
+            continue;
+        }
+
+        // the stray is a seconds-old empty shell: closing it early loses
+        // nothing and ends the "phantom local pane" flash before the slow
+        // part (ssh round-trip) begins
+        for (stray, _, _) in &resolved {
+            let _ = local.request("pane.close", json!({ "pane_id": stray.pane_id })).await;
+        }
+
         let mut remote = RemoteHost::new(host, &env.state_dir);
         let (api, _status) = match remote.connect_api().await {
             Ok(c) => c,
             Err(e) => {
-                println!("adopt: {} unreachable ({e}) — leaving local pane(s) as-is", host.name);
+                println!(
+                    "adopt: {} unreachable ({e}) — local split(s) closed, no remote pane created",
+                    host.name
+                );
                 continue;
             }
         };
         let rsnap = fetch_snapshot(&api).await?;
 
-        for stray in strays {
-            let sibs: Vec<&PaneInfo> = snap
-                .panes
-                .iter()
-                .filter(|p| p.tab_id == stray.tab_id && owned.contains(&p.pane_id))
-                .collect();
-            let Some((src, dir)) = pick_source(&snap, stray, &sibs) else {
-                println!("adopt: stray {} has no mirror sibling — leaving it local", stray.pane_id);
-                continue;
-            };
-            let Some(rid) = pane_rid.get(&src.pane_id) else { continue };
+        for (stray, dir, rid) in &resolved {
             let cwd = rsnap
                 .panes
                 .iter()
-                .find(|p| &&p.pane_id == rid)
+                .find(|p| &p.pane_id == rid)
                 .and_then(|p| p.foreground_cwd.clone().or_else(|| p.cwd.clone()));
             api.request(
                 "pane.split",
                 json!({ "target_pane_id": rid, "direction": dir, "cwd": cwd, "focus": false }),
             )
             .await?;
-            // only after the remote split exists does closing the stray lose nothing
-            let _ = local.request("pane.close", json!({ "pane_id": stray.pane_id })).await;
             println!(
                 "adopt: replaced local pane {} with a remote {dir} split of {rid} on {}",
                 stray.pane_id, host.name
