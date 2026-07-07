@@ -498,11 +498,27 @@ impl App {
         }
     }
 
+    /// Mirror remote_mouse onto the local terminal's mouse-tracking grab.
+    /// Grabbed: clicks/drags/wheel reach us for forwarding (remote TUI wants
+    /// them). Released: the hosting terminal owns the mouse again, so native
+    /// drag-select/copy works while the remote is at a plain prompt.
+    fn sync_mouse_grab(&mut self) {
+        if !self.tty {
+            return;
+        }
+        write_stdout(if self.remote_mouse {
+            "\x1b[?1002h\x1b[?1006h"
+        } else {
+            "\x1b[?1002l\x1b[?1006l"
+        });
+    }
+
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
         // fresh attach: assume no remote mouse tracking until the remote's
         // output re-declares it (a full-screen app re-emits on redraw).
         self.remote_mouse = false;
+        self.sync_mouse_grab();
         // and re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
         let (cols, rows) = match m {
@@ -590,8 +606,13 @@ impl App {
         if let Ok(decoded) = B64.decode(bytes) {
             frame_dbg(&self.args.pane_target, &frame, &decoded);
             // track whether the remote app wants mouse input, so control-mode
-            // clicks/drags are only forwarded when it does (see handle_stdin)
+            // clicks/drags are only forwarded when it does (see handle_stdin),
+            // and mirror transitions onto the local grab (selection vs forward)
+            let had_mouse = self.remote_mouse;
             scan_mouse_mode(&decoded, &mut self.remote_mouse);
+            if self.remote_mouse != had_mouse {
+                self.sync_mouse_grab();
+            }
             self.grid.apply(&String::from_utf8_lossy(&decoded));
             // reconcile predictive echo against the authoritative frame
             self.predict.on_frame(&self.grid);
@@ -735,7 +756,11 @@ pub async fn run(args: Args) -> Result<()> {
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h");
+        // alt-screen only — the local mouse grab (1002/1006) is DYNAMIC: it
+        // mirrors remote_mouse (see sync_mouse_grab), so while the remote is a
+        // plain shell the hosting terminal keeps native drag-select/copy, and
+        // the grab engages only when a remote app actually wants the mouse.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H");
         RawMode::enable()
     } else {
         None
