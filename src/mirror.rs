@@ -389,7 +389,39 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     //    so this pass can't recreate them (the snapshot still lists the object).
     //    With close_remote_on_local_close, also close the remote object; section
     //    2 reaps the tombstoned entry once the remote is gone.
-    let close_remote = deps.close_remote_on_local_close;
+    //
+    //    Manual closes mirror to the remote; INCIDENTAL disappearances must
+    //    not: a local server restart, a teardown race, or session-restore id
+    //    renumbering vanishes everything at once, and mirroring that would
+    //    destroy every remote pane (agents included). A click is one object
+    //    per pass; an incident is all mapped workspaces (when >1) or a burst
+    //    of panes — those tombstone only, and the zombie heal rebuilds them.
+    let vanished_ws = state
+        .workspaces
+        .iter()
+        .filter(|(rid, e)| {
+            !e.is_tombstoned()
+                && !local_ws_ids.contains(&e.local_id)
+                && remote_ws_ids.contains(rid.as_str())
+        })
+        .count();
+    let total_ws = state.workspaces.values().filter(|e| !e.is_tombstoned()).count();
+    let vanished_panes = state
+        .panes
+        .iter()
+        .filter(|(rid, e)| {
+            !e.is_tombstoned()
+                && !local_pane_ids.contains(e.local_id.as_str())
+                && remote_pane_ids.contains(rid.as_str())
+        })
+        .count();
+    let mass_incident = (total_ws > 1 && vanished_ws == total_ws) || vanished_panes >= 4;
+    let close_remote = deps.close_remote_on_local_close && !mass_incident;
+    if deps.close_remote_on_local_close && mass_incident {
+        log.log(&format!(
+            "mass disappearance ({vanished_ws}/{total_ws} workspaces, {vanished_panes} panes) — incidental, tombstoning without remote closes"
+        ));
+    }
     let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
         if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
