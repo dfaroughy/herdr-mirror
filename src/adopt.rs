@@ -28,6 +28,16 @@ use crate::util::{Env, Result};
 
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
+// NOTE: workspace adoption (new-space-from-a-mirror → remote workspace) was
+// attempted 2026-07-07 and REVERTED after a runaway: each mirrored-back
+// workspace is itself briefly an unmapped single-pane sentinel workspace, so
+// concurrent adopt invocations treated the daemon's own mirror-backs as
+// strays and created remote workspaces in a feedback loop (~245 junk
+// workspaces). A safe version needs, at minimum: an exclusive lock across
+// adopt invocations, a daemon-ownership marker readable BEFORE the state
+// file is saved (e.g. label prefix set at creation), and close-stray-first
+// ordering so a second pass can never re-adopt the same workspace.
+
 pub async fn run(env: Env) -> Result<()> {
     tokio::time::sleep(SETTLE).await;
     let config = load_config(&env.config_dir)?;
