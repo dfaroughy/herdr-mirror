@@ -119,6 +119,51 @@ impl Grid {
             })
             .collect()
     }
+
+    /// First grid row shown when painting into an out_rows-tall window
+    /// (bottom-anchored). The mouse→grid coordinate map must use the same
+    /// formula as the renderer or highlights land one row off.
+    pub fn window_offset(&self, out_rows: usize) -> usize {
+        let bottom = self.content_bottom.max(self.cursor_row);
+        (bottom + 1).saturating_sub(out_rows)
+    }
+
+    /// Text of the inclusive linear range start..=end ((row, col), start ≤ end).
+    /// Rows that are wrapped continuations — the grid row runs non-blank into
+    /// its last column — join to the next row without a newline, so copied
+    /// prose comes out as logical lines, not screen rows.
+    pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let mut out = String::new();
+        for r in start.0..=end.0.min(self.height.saturating_sub(1)) {
+            let cells = &self.rows[r];
+            let from = if r == start.0 { start.1 } else { 0 };
+            let to = if r == end.0 { (end.1 + 1).min(self.width) } else { self.width };
+            let row_text: String = (from..to)
+                .map(|c| cells.get(c).and_then(|c| c.as_ref()).map(|c| c.ch).unwrap_or(' '))
+                .collect();
+            let last = r == end.0.min(self.height.saturating_sub(1));
+            let wrapped = !last
+                && self
+                    .rows[r]
+                    .last()
+                    .and_then(|c| c.as_ref())
+                    .is_some_and(|c| c.ch != ' ');
+            if wrapped {
+                out.push_str(&row_text);
+            } else {
+                out.push_str(row_text.trim_end());
+                if !last {
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Is grid position p inside the inclusive linear (row-major) range s..=e?
+pub fn in_selection(p: (usize, usize), s: (usize, usize), e: (usize, usize)) -> bool {
+    p >= s && p <= e
 }
 
 /// CSI: ESC [ <params: 0-9;:?> <final: alpha>. Returns (params, final, char len).
@@ -181,9 +226,15 @@ impl Renderer {
 
     /// Build the ANSI to paint the grid into an out_cols × out_rows terminal.
     /// Bottom-anchored window: agent TUIs live at the bottom of the screen.
-    pub fn paint(&mut self, grid: &Grid, out_cols: usize, out_rows: usize) -> String {
-        let bottom = grid.content_bottom.max(grid.cursor_row);
-        let offset_r = (bottom + 1).saturating_sub(out_rows);
+    /// `sel`: normalized inclusive selection in GRID coords, reverse-video'd.
+    pub fn paint(
+        &mut self,
+        grid: &Grid,
+        out_cols: usize,
+        out_rows: usize,
+        sel: Option<((usize, usize), (usize, usize))>,
+    ) -> String {
+        let offset_r = grid.window_offset(out_rows);
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
         // paint every local row (missing rows blank-fill), or the pane stays
         // blank before the first frame and the status row is unreachable
@@ -195,13 +246,17 @@ impl Renderer {
             let empty = Vec::new();
             let cells = grid.rows.get(r + offset_r).unwrap_or(&empty);
             let mut line = String::new();
-            let mut prev_sgr: Option<&str> = None;
+            let mut prev_key: Option<(&str, bool)> = None;
             for c in 0..out_cols.min(grid.width) {
                 let cell = cells.get(c).and_then(|c| c.as_ref());
                 let sgr = cell.map(|c| &*c.sgr).unwrap_or("\x1b[0m");
-                if prev_sgr != Some(sgr) {
+                let selected = sel.is_some_and(|(s, e)| in_selection((r + offset_r, c), s, e));
+                if prev_key != Some((sgr, selected)) {
                     line.push_str(if sgr.is_empty() { "\x1b[0m" } else { sgr });
-                    prev_sgr = Some(sgr);
+                    if selected {
+                        line.push_str("\x1b[7m");
+                    }
+                    prev_key = Some((sgr, selected));
                 }
                 line.push(cell.map(|c| c.ch).unwrap_or(' '));
             }
@@ -273,12 +328,39 @@ mod tests {
     }
 
     #[test]
+    fn extract_joins_wrapped_rows() {
+        let mut g = Grid::new();
+        g.resize(6, 4);
+        // row0 runs into the last column (wrapped), rows 1-2 are short
+        g.apply("\x1b[1;1Habcdef\x1b[2;1Hgh\x1b[3;1Hxy");
+        // full selection: wrapped row joins, short row gets a newline
+        assert_eq!(g.extract_text((0, 0), (2, 5)), "abcdefgh\nxy");
+        // partial: mid-row start, mid-row end
+        assert_eq!(g.extract_text((0, 2), (1, 0)), "cdefg");
+        // single row slice
+        assert_eq!(g.extract_text((1, 0), (1, 5)), "gh");
+    }
+
+    #[test]
+    fn paint_reverses_selection() {
+        let mut g = Grid::new();
+        g.resize(4, 2);
+        g.apply("\x1b[1;1Habcd\x1b[2;1Hwxyz");
+        let mut r = Renderer::new();
+        let out = r.paint(&g, 4, 2, Some(((0, 1), (0, 2))));
+        assert!(out.contains("\x1b[7m"));
+        // growing the selection repaints via the row diff alone
+        let out2 = r.paint(&g, 4, 2, Some(((0, 1), (0, 3))));
+        assert!(out2.contains("\x1b[7m"));
+    }
+
+    #[test]
     fn status_paints_on_empty_grid() {
         // before the first frame the grid is 0x0 — status must still render
         let g = Grid::new();
         let mut r = Renderer::new();
         r.status("reconnecting in 5s");
-        let out = r.paint(&g, 80, 24);
+        let out = r.paint(&g, 80, 24, None);
         assert!(out.contains("reconnecting in 5s"));
     }
 
@@ -288,14 +370,14 @@ mod tests {
         g.resize(5, 10);
         g.apply("\x1b[10;1Hlast"); // content at the bottom row of a tall grid
         let mut r = Renderer::new();
-        let out = r.paint(&g, 5, 3);
+        let out = r.paint(&g, 5, 3, None);
         // window shows rows 8..10 → "last" lands on the visible last row
         assert!(out.contains("last"));
         r.status("HELLO");
-        let out2 = r.paint(&g, 5, 3);
+        let out2 = r.paint(&g, 5, 3, None);
         assert!(out2.contains("HELLO"));
         // unchanged rows are not repainted
-        let out3 = r.paint(&g, 5, 3);
+        let out3 = r.paint(&g, 5, 3, None);
         assert!(!out3.contains("last"));
     }
 }

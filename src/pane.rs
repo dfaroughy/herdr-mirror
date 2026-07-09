@@ -448,6 +448,27 @@ struct App {
     pending_scroll: i32,
     scroll_pos: (u32, u32),
     scroll_flush_at: Option<Instant>,
+    /// local drag selection over the mirrored grid (grid coords). Active while
+    /// the remote has no mouse mode; copy lands in the macOS clipboard via
+    /// pbcopy on release. anchor = press point, head = latest drag point,
+    /// fixed = released (highlight stays until the next press).
+    sel_anchor: Option<(usize, usize)>,
+    sel_head: Option<(usize, usize)>,
+    sel_fixed: bool,
+}
+
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write as _;
+    let Ok(mut child) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let ok = child.stdin.take().is_some_and(|mut s| s.write_all(text.as_bytes()).is_ok());
+    child.wait().map(|st| st.success()).unwrap_or(false) && ok
 }
 
 /// wheel-burst accumulation window; ~1/5 of the laptop↔NERSC round trip, so a
@@ -480,6 +501,66 @@ impl App {
         self.send(msg).await;
     }
 
+    /// mouse → grid coords, clamped; must mirror the renderer's window math
+    fn mouse_to_grid(&self, x: u32, y: u32) -> Option<(usize, usize)> {
+        if self.grid.width == 0 || self.grid.height == 0 {
+            return None;
+        }
+        let (_, rows) = term_size();
+        let r = (y.saturating_sub(1) as usize + self.grid.window_offset(rows))
+            .min(self.grid.height - 1);
+        let c = (x.saturating_sub(1) as usize).min(self.grid.width - 1);
+        Some((r, c))
+    }
+
+    fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, h) = (self.sel_anchor?, self.sel_head?);
+        Some(if a <= h { (a, h) } else { (h, a) })
+    }
+
+    fn on_select_event(&mut self, btn: u32, x: u32, y: u32, press: bool) {
+        let Some(pos) = self.mouse_to_grid(x, y) else { return };
+        match (btn, press) {
+            // left press: new anchor (clears any previous highlight); the
+            // renderer's row diff repaints exactly the rows whose highlight
+            // changed — no invalidate needed
+            (0, true) => {
+                self.sel_anchor = Some(pos);
+                self.sel_head = Some(pos);
+                self.sel_fixed = false;
+                self.paint();
+            }
+            // left drag: extend
+            (32, true) if self.sel_anchor.is_some() && !self.sel_fixed => {
+                if self.sel_head != Some(pos) {
+                    self.sel_head = Some(pos);
+                    self.paint();
+                }
+            }
+            // left release: copy if it was a drag, clear if it was a click
+            (0, false) => {
+                match self.selection() {
+                    Some((s, e)) if s != e => {
+                        let text = self.grid.extract_text(s, e);
+                        let n = text.chars().count();
+                        if copy_to_clipboard(&text) {
+                            self.hint(&format!("copied {n} chars"));
+                        } else {
+                            self.hint("copy failed (pbcopy)");
+                        }
+                        self.sel_fixed = true;
+                    }
+                    _ => {
+                        self.sel_anchor = None;
+                        self.sel_head = None;
+                        self.paint();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn paint(&mut self) {
         if !self.tty {
             return;
@@ -489,7 +570,8 @@ impl App {
             self.renderer.invalidate();
         }
         let (cols, rows) = term_size();
-        let mut out = self.renderer.paint(&self.grid, cols, rows);
+        let sel = self.selection();
+        let mut out = self.renderer.paint(&self.grid, cols, rows, sel);
         // inject the prediction overlay inside the synchronized-update block
         let overlay = self.predict.overlay(&self.grid, cols, rows);
         if !overlay.is_empty() {
@@ -552,9 +634,13 @@ impl App {
         // output re-declares it (a full-screen app re-emits on redraw).
         self.remote_mouse = false;
         self.sync_mouse_grab();
-        // scroll deltas aimed at the old session don't belong to the new one
+        // scroll deltas / selections aimed at the old session don't belong
+        // to the new one
         self.pending_scroll = 0;
         self.scroll_flush_at = None;
+        self.sel_anchor = None;
+        self.sel_head = None;
+        self.sel_fixed = false;
         // and re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
         let (cols, rows) = match m {
@@ -644,6 +730,12 @@ impl App {
             // track whether the remote app wants mouse input, so control-mode
             // clicks/drags are only forwarded when it does (see handle_stdin)
             scan_mouse_mode(&decoded, &mut self.remote_mouse);
+            if self.remote_mouse && self.sel_anchor.is_some() {
+                // a remote TUI took the mouse — local selection yields
+                self.sel_anchor = None;
+                self.sel_head = None;
+                self.sel_fixed = false;
+            }
             self.grid.apply(&String::from_utf8_lossy(&decoded));
             // reconcile predictive echo against the authoritative frame
             self.predict.on_frame(&self.grid);
@@ -755,9 +847,11 @@ impl App {
                 } else if self.remote_mouse {
                     // remote app has mouse tracking on — forward the click/drag
                     rest.extend_from_slice(&buf[i..i + len]);
+                } else {
+                    // remote has no mouse mode: clicks drive the LOCAL drag
+                    // selection over the mirrored grid instead of being dropped
+                    self.on_select_event(btn, x, y, press);
                 }
-                // else: remote has no mouse mode (e.g. a plain shell) — drop the
-                // event so raw SGR reports don't land on the prompt as keystrokes
                 i += len;
             } else {
                 rest.push(buf[i]);
@@ -840,6 +934,9 @@ pub async fn run(args: Args) -> Result<()> {
         pending_scroll: 0,
         scroll_pos: (0, 0),
         scroll_flush_at: None,
+        sel_anchor: None,
+        sel_head: None,
+        sel_fixed: false,
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
