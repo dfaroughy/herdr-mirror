@@ -90,7 +90,14 @@ pub fn load_state(state_dir: &Path, host: &str) -> HostState {
 
 pub fn save_state(state_dir: &Path, host: &str, state: &HostState) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    std::fs::write(state_path(state_dir, host), serde_json::to_string_pretty(state)?)?;
+    // write-then-rename: the daemon rewrites this file every converge pass
+    // while event-driven adopt reads it concurrently — a plain truncate+write
+    // lets a racing reader parse a torn file as an EMPTY map (load_state
+    // defaults on parse failure) and silently skip real strays
+    let path = state_path(state_dir, host);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
