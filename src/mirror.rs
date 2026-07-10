@@ -333,23 +333,44 @@ async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[Str
 
 /// cwd every mirror pane runs in, doubling as the loop-guard marker: it's set at
 /// pane creation so it's in the snapshot immediately (no exec race), and its name
-/// can't collide with a real dir.
+/// can't collide with a real dir. Per-host subdir (.mirror-pane/<host>) so that
+/// objects herdr creates by INHERITING a mirror pane's cwd (native splits, the
+/// sidebar "new" workspace) carry which host they came from — adopt reads the
+/// host straight out of the stray's cwd.
 const MIRROR_CWD_MARKER: &str = ".mirror-pane";
 
-fn mirror_pane_cwd(state_dir: &std::path::Path) -> std::path::PathBuf {
-    state_dir.join(MIRROR_CWD_MARKER)
+pub fn mirror_pane_cwd(state_dir: &std::path::Path, host: &str) -> std::path::PathBuf {
+    state_dir.join(MIRROR_CWD_MARKER).join(host)
 }
 
-/// Is this remote pane another herdr-mirror's streamer pane? Read from the
-/// snapshot cwd marker — free, and race-free.
+/// Is this pane a mirror streamer pane (or something spawned inheriting one's
+/// cwd)? Component check, so both the legacy flat marker dir and the per-host
+/// subdirs match.
 pub fn pane_is_mirror(p: &PaneInfo) -> bool {
-    let is_marker = |c: &Option<String>| {
-        c.as_deref()
-            .and_then(|s| std::path::Path::new(s).file_name())
-            .and_then(|f| f.to_str())
-            == Some(MIRROR_CWD_MARKER)
+    let has_marker = |c: &Option<String>| {
+        c.as_deref().is_some_and(|s| {
+            std::path::Path::new(s).components().any(|c| c.as_os_str() == MIRROR_CWD_MARKER)
+        })
     };
-    is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
+    has_marker(&p.foreground_cwd) || has_marker(&p.cwd)
+}
+
+/// Which host does this pane's marker cwd belong to? (None for the legacy flat
+/// dir or non-mirror cwds.)
+pub fn mirror_cwd_host(p: &PaneInfo) -> Option<String> {
+    let host_of = |c: &Option<String>| {
+        let path = std::path::Path::new(c.as_deref()?);
+        let mut prev_was_marker = false;
+        for comp in path.components() {
+            let s = comp.as_os_str().to_str()?;
+            if prev_was_marker {
+                return Some(s.to_string());
+            }
+            prev_was_marker = s == MIRROR_CWD_MARKER;
+        }
+        None
+    };
+    host_of(&p.cwd).or_else(|| host_of(&p.foreground_cwd))
 }
 
 // --- the converge pass ---
@@ -383,7 +404,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
     let cmd_for = cmd_for_pane(deps, &sizes);
-    let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
+    let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir, &deps.host.name));
 
     // 1. detect mirrors the user closed locally. Always tombstone (never remove)
     //    so this pass can't recreate them (the snapshot still lists the object).
@@ -670,7 +691,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             if !tab_exists {
                 // non-git cwd so herdr shows no (misleading) sidebar git status
                 // for the mirror; the pane exec's the streamer regardless
-                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                let cwd = mirror_pane_cwd(&deps.state_dir, &deps.host.name).display().to_string();
                 let root = map_node(&exported.layout.root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 // tab_id and workspace_id are mutually exclusive on layout.apply
@@ -722,7 +743,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 // terminal as a phantom "mirror" agent row.
                 // non-git cwd so herdr shows no (misleading) sidebar git status
                 // for the mirror; the pane exec's the streamer regardless
-                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                let cwd = mirror_pane_cwd(&deps.state_dir, &deps.host.name).display().to_string();
                 for rp in &remote_panes_in_tab {
                     if state.panes.contains_key(&rp.pane_id) {
                         continue;
