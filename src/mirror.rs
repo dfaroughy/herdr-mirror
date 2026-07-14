@@ -443,11 +443,34 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             "mass disappearance ({vanished_ws}/{total_ws} workspaces, {vanished_panes} panes) — incidental, tombstoning without remote closes"
         ));
     }
+    // remote panes running a live agent (claude/codex/…), and the workspaces
+    // that contain them. A local close is NEVER propagated to these: closing a
+    // pane/workspace hosting a working agent is almost never intended, and a
+    // wrapper crash / mis-kill / fat-finger is indistinguishable from a
+    // deliberate close (2026-07-14 incident — a killed wrapper propagated a
+    // close that killed a live Claude). Tombstone + warn instead.
+    let live_agent_panes: HashSet<&str> = remote_snap
+        .agents
+        .iter()
+        .filter(|a| a.has_agent())
+        .map(|a| a.pane_id.as_str())
+        .collect();
+    let live_agent_ws: HashSet<&str> = remote_snap
+        .panes
+        .iter()
+        .filter(|p| live_agent_panes.contains(p.pane_id.as_str()))
+        .map(|p| p.workspace_id.as_str())
+        .collect();
+
     let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
         if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
             entry.tombstone = Some(true);
-            if close_remote {
+            if close_remote && live_agent_ws.contains(rid.as_str()) {
+                log.log(&format!(
+                    "workspace mirror for {rid} closed locally BUT contains a live agent — tombstoning, NOT closing remote"
+                ));
+            } else if close_remote {
                 ws_close_remote.push(rid.clone());
             } else {
                 log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
@@ -473,7 +496,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             match ws_entry {
                 Some(w) if !w.is_tombstoned() && local_ws_ids.contains(&w.local_id) => {
                     entry.tombstone = Some(true);
-                    if close_remote {
+                    if close_remote && live_agent_panes.contains(rid.as_str()) {
+                        log.log(&format!(
+                            "pane mirror for {rid} closed locally BUT a live agent is running — tombstoning, NOT closing remote (use restore/teardown+start to re-mirror)"
+                        ));
+                    } else if close_remote {
                         pane_close_remote.push(rid.clone());
                     } else {
                         log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
