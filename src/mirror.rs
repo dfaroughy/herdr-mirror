@@ -647,9 +647,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 struct CreatedTab {
                     tab_id: String,
                 }
+                // create in the (non-git) marker cwd the mirror panes use, so the
+                // workspace's default pane never flashes a misleading sidebar git
+                // branch before layout.apply swaps in the real mirror panes
+                // (upstream a781125, adapted to the per-host marker dir)
+                let ws_cwd = mirror_pane_cwd(&deps.state_dir, &deps.host.name).display().to_string();
                 let created: Created = deps
                     .local
-                    .request_t("workspace.create", json!({ "label": label, "focus": false }))
+                    .request_t("workspace.create", json!({ "label": label, "cwd": ws_cwd, "focus": false }))
                     .await?;
                 WsEntry {
                     local_id: created.workspace.workspace_id,
