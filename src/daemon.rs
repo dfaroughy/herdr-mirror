@@ -250,8 +250,18 @@ async fn run_connected(
     }
 }
 
+// Recovery escalation: after this many consecutive reconnect failures the
+// retry is clearly not going to take (the usual cause is the remote moving —
+// e.g. a recycled HPC login node), so run the host's recovery_command instead
+// of retrying blind. The cooldown keeps a recovery that can't succeed (remote
+// genuinely unreachable) from spawning doctors in a loop.
+const RECOVERY_AFTER: usize = 3;
+const RECOVERY_COOLDOWN: Duration = Duration::from_secs(900);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut backoff_idx = 0usize;
+    let mut last_recovery: Option<Instant> = None;
     loop {
         let e = match run_connected(&ctx, &mut poke, &mut backoff_idx).await {
             Ok(()) => unreachable!("run_connected only returns on error"),
@@ -262,10 +272,73 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         let delay = delays[backoff_idx.min(delays.len() - 1)];
         backoff_idx += 1;
         ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
-        tokio::time::sleep(Duration::from_secs(delay)).await;
+        if backoff_idx >= RECOVERY_AFTER
+            && ctx.host.recovery_command.is_some()
+            && last_recovery.map_or(true, |t| t.elapsed() >= RECOVERY_COOLDOWN)
+        {
+            last_recovery = Some(Instant::now());
+            run_recovery(&ctx).await;
+            // whatever recovery fixed needs a beat to come up, then retry now
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        } else {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
         // drain stale pokes accumulated while down (reconnect converges anyway)
         while poke.try_recv().is_ok() {}
     }
+}
+
+async fn run_recovery(ctx: &HostCtx) {
+    let cmd = ctx.host.recovery_command.as_deref().expect("caller checked");
+    ctx.log.log(&format!(
+        "[{}] {RECOVERY_AFTER} consecutive failures — escalating to recovery: {cmd}",
+        ctx.host.name
+    ));
+    let mut sh = tokio::process::Command::new("sh");
+    sh.arg("-c").arg(cmd).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(RECOVERY_TIMEOUT, sh.output()).await {
+        Err(_) => ctx.log.log(&format!(
+            "[{}] recovery timed out after {}s — killed",
+            ctx.host.name,
+            RECOVERY_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) => ctx.log.log(&format!("[{}] recovery failed to spawn: {e}", ctx.host.name)),
+        Ok(Ok(out)) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            for line in text.lines().map(strip_ansi) {
+                let line = line.trim();
+                if !line.is_empty() {
+                    ctx.log.log(&format!("[{}] recovery │ {line}", ctx.host.name));
+                }
+            }
+            ctx.log.log(&format!("[{}] recovery exited {}", ctx.host.name, out.status));
+        }
+    }
+}
+
+/// Recovery scripts print colored output; the daemon log wants plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(c2) = chars.next() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// After a local herdr server restart, session-restore resurrects mirror panes

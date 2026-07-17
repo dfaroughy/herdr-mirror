@@ -17,6 +17,11 @@ pub struct HostConfig {
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
     pub always_control: bool,
+    /// shell command the daemon runs (via `sh -c`) after several consecutive
+    /// reconnect failures, instead of retrying blind — e.g. a doctor script
+    /// that re-pins a migrated login node and restarts the remote server.
+    /// Unset = keep the plain retry loop.
+    pub recovery_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +68,7 @@ struct RawHost {
     remote_bin: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    recovery_command: Option<String>,
 }
 
 pub fn load_config(config_dir: &Path) -> Result<MirrorConfig> {
@@ -89,6 +95,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
             always_control: h.always_control.unwrap_or(global_always_control),
+            recovery_command: h.recovery_command,
             target: h.target,
             name,
         });
@@ -140,6 +147,17 @@ mod tests {
         let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
         assert!(!a.always_control); // inherits global off
         assert!(b.always_control); // per-host override on
+    }
+
+    #[test]
+    fn parses_recovery_command() {
+        let c = parse_config(
+            "[hosts.hpc]\ntarget = \"hpc-pin\"\nrecovery_command = \"~/bin/doctor.sh\"\n\
+             [hosts.plain]\ntarget = \"plain\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts[0].recovery_command.as_deref(), Some("~/bin/doctor.sh"));
+        assert_eq!(c.hosts[1].recovery_command, None);
     }
 
     #[test]
