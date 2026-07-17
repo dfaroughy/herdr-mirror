@@ -162,7 +162,6 @@ async fn run_connected(
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     let (remote, _status) = remote_host.connect_api().await?;
-    *backoff_idx = 0;
     let deps = ConvergeDeps {
         local: ctx.local.clone(),
         remote: remote.clone(),
@@ -178,6 +177,10 @@ async fn run_connected(
     let mut subscribed_key = String::from("<broadcast>");
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
+    // reset only once fully synced: a wedged server that accepts connections
+    // but times out on subscribe/converge must still count as consecutive
+    // failures, or it flaps forever without ever escalating to recovery
+    *backoff_idx = 0;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
     let mut converge_at: Option<Instant> = None;
