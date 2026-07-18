@@ -65,6 +65,28 @@ pub struct RemoteHost {
     forwarded: bool,
 }
 
+/// Tear down the host's ControlMaster (if any) so the next connect starts a
+/// fresh TCP connection. A wedged master still passes `-O check` — that only
+/// round-trips to the LOCAL mux process — so after repeated connection
+/// failures the only safe move is to kill it outright.
+pub async fn kill_master(cfg: &HostConfig, state_dir: &std::path::Path) {
+    let ctl = state_dir.join(format!("{}.ctl", cfg.name));
+    if !ctl.exists() {
+        return;
+    }
+    let args: Vec<String> = vec![
+        "-S".into(),
+        ctl.display().to_string(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-O".into(),
+        "exit".into(),
+        cfg.target.clone(),
+    ];
+    let _ = ssh(&args, 10000).await;
+    let _ = std::fs::remove_file(&ctl);
+}
+
 impl RemoteHost {
     pub fn new(cfg: &HostConfig, state_dir: &std::path::Path) -> RemoteHost {
         RemoteHost {
@@ -91,6 +113,10 @@ impl RemoteHost {
             return Ok(());
         }
         self.forwarded = false;
+        // the check failed, so any socket sitting there belongs to a dead or
+        // wedged master — spawning -M against it would "disable multiplexing"
+        // and linger as a useless plain connection
+        let _ = std::fs::remove_file(&self.ctl_path);
         let mut start: Vec<String> =
             vec!["-M".into(), "-S".into(), self.ctl_path.display().to_string()];
         start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));

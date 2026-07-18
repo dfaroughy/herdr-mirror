@@ -188,11 +188,23 @@ async fn run_connected(
     let mut closes_at: Option<Instant> = None;
     let mut pending_status: HashMap<String, Value> = HashMap::new();
     let mut pending_closes: Vec<String> = Vec::new();
+    // Liveness for the long-lived event stream: a mux channel can die without
+    // ever delivering EOF (observed 2026-07-18 — a network flap left the
+    // stream half-open while fresh per-request channels kept working, so the
+    // daemon sat "connected" on a dead pipe for 15 minutes). If no event
+    // arrives for STREAM_IDLE, force a fresh subscription: a dead stream gets
+    // rebuilt; a wedged master fails the bounded subscribe ack and drops us
+    // into the reconnect path.
+    let mut last_event = Instant::now();
+    let mut stream_check_at = Instant::now() + STREAM_IDLE;
 
     loop {
-        let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
+        let sleep = sleep_until_earliest([converge_at, status_at, closes_at, Some(stream_check_at)]);
         tokio::select! {
             ev = stream.next() => {
+                if ev.is_some() {
+                    last_event = Instant::now();
+                }
                 match ev {
                     None => return Err(err("event stream closed")),
                     // status changes take the fast-path; structure changes
@@ -248,6 +260,15 @@ async fn run_connected(
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
                 }
+                if stream_check_at <= now {
+                    stream_check_at = now + STREAM_IDLE;
+                    if now.duration_since(last_event) >= STREAM_IDLE {
+                        // invalidate the key so the next converge's resubscribe
+                        // rebuilds the stream instead of skipping as unchanged
+                        subscribed_key = String::from("<idle-check>");
+                        converge_at.get_or_insert(now);
+                    }
+                }
             }
         }
     }
@@ -261,6 +282,11 @@ async fn run_connected(
 const RECOVERY_AFTER: usize = 3;
 const RECOVERY_COOLDOWN: Duration = Duration::from_secs(900);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Force a stream resubscribe after this much event silence (see run_connected).
+const STREAM_IDLE: Duration = Duration::from_secs(180);
+/// From this many consecutive failures on, tear down the ssh master before
+/// retrying — `-O check` can't distinguish a healthy master from a wedged one.
+const MASTER_RESET_AFTER: usize = 2;
 
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut backoff_idx = 0usize;
@@ -275,6 +301,10 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         let delay = delays[backoff_idx.min(delays.len() - 1)];
         backoff_idx += 1;
         ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+        if backoff_idx >= MASTER_RESET_AFTER {
+            ctx.log.log(&format!("[{}] resetting ssh master after repeated failures", ctx.host.name));
+            crate::remote::kill_master(&ctx.host, &ctx.env_state_dir).await;
+        }
         if backoff_idx >= RECOVERY_AFTER
             && ctx.host.recovery_command.is_some()
             && last_recovery.map_or(true, |t| t.elapsed() >= RECOVERY_COOLDOWN)
