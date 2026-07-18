@@ -18,14 +18,26 @@ use crate::util::{err, Result};
 const MIN_PREVIEW_BUILD: &str = "2026-06-30";
 
 /// Common ssh options, shared by the daemon's master and every pane stream.
-pub const SSH_COMMON_OPTS: [&str; 6] = [
+/// ConnectTimeout bounds the handshake: NERSC's round-robin login pool can
+/// contain a node that accepts TCP then stalls in banner/kex — without a
+/// timeout that hang is forever (keepalives only engage post-session).
+pub const SSH_COMMON_OPTS: [&str; 8] = [
     "-o",
     "BatchMode=yes",
     "-o",
     "ServerAliveInterval=15",
     "-o",
     "ServerAliveCountMax=3",
+    "-o",
+    "ConnectTimeout=15",
 ];
+
+/// Pane streams additionally bypass any ssh_config-level ControlMaster: a
+/// wedged shared master (observed 2026-07-18 — a tunnel became the config
+/// master, wedged in a flap, and every streamer queued on its corpse) hangs
+/// all followers in pselect with no timeout. Streams carry their own
+/// keepalives, so each owns its connection outright.
+pub const SSH_STREAM_OPTS: [&str; 4] = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
 
 #[derive(Debug)]
 pub struct RemoteStatus {

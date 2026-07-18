@@ -179,6 +179,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     );
     let mut child = tokio::process::Command::new("ssh")
         .args(crate::remote::SSH_COMMON_OPTS)
+        .args(crate::remote::SSH_STREAM_OPTS)
         .arg(&args.ssh_target)
         .arg(cmd)
         .stdin(Stdio::piped())
@@ -413,6 +414,13 @@ fn frame_dbg(pane: &str, frame: &Frame, decoded: &[u8]) {
 const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+/// No ssh option bounds the auth phase: a sick login node that accepts TCP,
+/// serves its banner, then stalls (wedged home-FS mount blocking sshd) hangs
+/// the session forever (observed 2026-07-18 — six streamers batch-resolved
+/// the same round-robin IP and froze together). The wrapper owns the
+/// deadline: no first frame within this window → kill the child and retry,
+/// which also re-rolls the DNS lottery.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct App {
     args: Args,
@@ -430,6 +438,8 @@ struct App {
 
     backoff_idx: usize,
     reconnect_at: Option<(Instant, Mode)>,
+    /// armed at spawn, cleared by the session's first frame (see ATTACH_TIMEOUT)
+    attach_deadline: Option<(Instant, Mode)>,
     /// consecutive quick control failures → fall back to observe
     control_failures: u32,
     control_sticky: bool,
@@ -664,6 +674,7 @@ impl App {
                     self.pending_input.clear();
                 }
                 self.session = Some(s);
+                self.attach_deadline = Some((Instant::now() + ATTACH_TIMEOUT, m));
                 // always-control has no release, so no "ctrl+\ to release" hint
                 self.renderer.status(
                     if m == Mode::Control && !self.args.always_control {
@@ -678,7 +689,12 @@ impl App {
     }
 
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
-        let delay = BACKOFF[self.backoff_idx.min(BACKOFF.len() - 1)];
+        // per-pane jitter: sibling streamers spawned in the same instant get
+        // the same round-robin DNS answer and fail on the same sick node
+        // together — stagger the retries so they re-resolve at distinct times
+        let jitter: u64 =
+            self.args.pane_target.bytes().fold(0u64, |a, b| a.wrapping_mul(31) + b as u64) % 3000;
+        let delay = BACKOFF[self.backoff_idx.min(BACKOFF.len() - 1)] + jitter;
         self.backoff_idx += 1;
         let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
         self.renderer
@@ -708,6 +724,8 @@ impl App {
         if self.session.as_ref().map(|s| s.gen) != Some(gen) {
             return; // stale frame from a replaced session
         }
+        // any frame proves the whole path (connect, auth, exec, stream)
+        self.attach_deadline = None;
         if frame.kind == "terminal.closed" {
             let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
             self.renderer.status(&format!("remote terminal closed{suffix}"));
@@ -920,6 +938,7 @@ pub async fn run(args: Args) -> Result<()> {
         mode: Mode::Observe,
         switching_to: None,
         switch_at: None,
+        attach_deadline: None,
         session: None,
         next_gen: 0,
         backoff_idx: 0,
@@ -956,6 +975,7 @@ pub async fn run(args: Args) -> Result<()> {
         let sleep = crate::util::sleep_until_earliest([
             app.switch_at,
             app.reconnect_at.map(|(t, _)| t),
+            app.attach_deadline.map(|(t, _)| t),
             app.hint_clear_at,
             idle_at,
             app.predict.deadline(),
@@ -994,6 +1014,17 @@ pub async fn run(args: Args) -> Result<()> {
                     if t <= now {
                         app.reconnect_at = None;
                         app.connect(m).await;
+                    }
+                }
+                if let Some((t, m)) = app.attach_deadline {
+                    if t <= now {
+                        app.attach_deadline = None;
+                        if let Some(s) = app.session.take() {
+                            // taking the session first makes the child's late
+                            // SessionExit a stale no-op (gen mismatch)
+                            unsafe { libc::kill(s.pid, libc::SIGTERM) };
+                            app.schedule_reconnect(m, "attach timeout (sick login node?)");
+                        }
                     }
                 }
                 if app.hint_clear_at.is_some_and(|t| t <= now) {
