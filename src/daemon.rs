@@ -304,6 +304,15 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         if backoff_idx >= MASTER_RESET_AFTER {
             ctx.log.log(&format!("[{}] resetting ssh master after repeated failures", ctx.host.name));
             crate::remote::kill_master(&ctx.host, &ctx.env_state_dir).await;
+            // pane streamers mux through the dead master and outlive it as
+            // zombies reading dead pipes (observed 2026-07-18: every pane
+            // frozen for a day while the daemon itself reconnected fine).
+            // Kill them and tear down so the reconnect's converge rebuilds
+            // every mirror with a live streamer.
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", &format!("herdr-mirror pane {}", ctx.host.target)])
+                .status();
+            let _ = teardown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &ctx.log).await;
         }
         if backoff_idx >= RECOVERY_AFTER
             && ctx.host.recovery_command.is_some()
